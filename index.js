@@ -16,6 +16,8 @@ class Kraken extends EventEmitter {
     orderbookUpdateDistance = 5000,
     decimals = 0,
     debug = false,
+    autoConnect = false,
+    cancelOrdersOnProcessExit = false,
   }) {
     super();
     this.token = null;
@@ -29,7 +31,6 @@ class Kraken extends EventEmitter {
     this.decimals = decimals;
     this.orderbookUpdateDistance = orderbookUpdateDistance;
     this.http = new Http({ auth: this.credentials, agent: 'Kraken Wrapper' });
-    setImmediate(this.init.bind(this));
     this.bests = this.bests.bind(this);
     this.cached = {};
     this.initOrderbooks = this.initOrderbooks.bind(this);
@@ -48,7 +49,48 @@ class Kraken extends EventEmitter {
     this.pendingCancelByReqId = {};
     this.private_event_openOrders = this.private_event_openOrders.bind(this);
     this.gotFirstOwnTrades = false;
-    this.debug = false;
+    this.debug = debug;
+    this.initiated = {
+      public: false,
+      private: false,
+      markets: false,
+      assets: false,
+    };
+    if (!this.credentials) {
+      delete this.initiated.private;
+    }
+    this.initEmitted = false;
+    this.panic = 0;
+    if (cancelOrdersOnProcessExit) {
+      this.attachForceCancelOnProcessExit();
+    }
+
+    if (autoConnect) {
+      setImmediate(this.init.bind(this));
+    }
+  }
+
+  async onSIGINT() {
+    this.panic += 1;
+    this.log(`Caught interrupt signal (${this.panic} Panic abort at 9 tries)`);
+    if (this.panic >= 9) {
+      process.exit();
+    }
+    try {
+      this.log('cancelling all orders on SIGINT');
+      await this.cancelAllOrders();
+      this.log('initiating order cancelling on process exit');
+    } catch (e) {
+      this.log('appears there are no orders available to cancel');
+    }
+    // setTimeout(() => {
+    console.log('BYE');
+    process.exit();
+    // }, 500);
+  }
+
+  attachForceCancelOnProcessExit() {
+    process.on('SIGINT', this.onSIGINT.bind(this));
   }
 
   checkReinit() {
@@ -97,6 +139,10 @@ class Kraken extends EventEmitter {
     }
     clearTimeout(this.checkInitTimer);
     this.checkInitTimer = setTimeout(this.checkReinit.bind(this), this.pingPongInterval * 1.5);
+  }
+
+  orderbook(pair) {
+    return this.orderbooks[pair];
   }
 
   createOrderbook(pair) {
@@ -153,7 +199,26 @@ class Kraken extends EventEmitter {
     this.orderbooks = orderbooks;
   }
 
-  log(message, obj = {}, level = 'LOG', end = '\n', _debug = false) {
+  initOrderbook(pair) {
+    this.orderbooks[pair] = this.createOrderbook(pair);
+  }
+
+  initPair(pair) {
+    if (!this.marketPairs[pair]) {
+      throw new Error(`unknown pair ${pair}`);
+    }
+    if (this.orderbooks[pair]) {
+      return;
+    }
+    if (this.pairs.includes(pair)) {
+      this.pairs.push(pair);
+    }
+    this.initOrderbook(pair);
+    this.publicSubscribePairBook(pair);
+    this.publicSubscribePairTrades(pair);
+  }
+
+  log(message, obj = {}, level = 'LOG', end = '\n', _debug = this.debug) {
     if (this._log) {
       if (this.debug || _debug) {
         this._log(message, obj, level, end);
@@ -183,6 +248,8 @@ class Kraken extends EventEmitter {
     const rawpairs = await this.http.publicMethod('AssetPairs');
     this.initMarketAssets(rawassets);
     this.initMarketPairs(rawpairs);
+    this.initiated.markets = true;
+    this.initiated.assets = true;
   }
 
   initMarketAssets(rawassets) {
@@ -214,10 +281,22 @@ class Kraken extends EventEmitter {
     };
   }
 
-  async init() {
+  isInitiating() {
+    return Object.values(this.initiated).reduce((r, v) => r || v, false);
+  }
+
+  isInitiated(initiated = this.initiated) {
+    return Object.values(initiated).reduce((r, v) => r && v, true);
+  }
+
+  async init(force = false) {
+    if (!force && this.isInitiating()) {
+      return;
+    }
     await this.marketInfoInit();
+
     this.log('initializing orderbooks', {}, 'LOG', '\n', true);
-    this.initOrderbooks();
+
     if (this.credentials) {
       this.log('getting websocket token');
 
@@ -236,6 +315,9 @@ class Kraken extends EventEmitter {
     this.log('initializing checkReinit', {}, 'LOG', '\n', true);
     clearTimeout(this.checkInitTimer);
     this.checkInitTimer = setTimeout(this.checkReinit.bind(this), this.pingPongInterval * 1.5);
+    if (this.pairs.length > 0) {
+      this.initOrderbooks();
+    }
   }
 
   hasToken() {
@@ -288,17 +370,39 @@ class Kraken extends EventEmitter {
     this.log('public socket error', { message: (error || {}).message });
   }
 
-  publicWsOpen(x) {
-    this.log('public socket open', { x: x || 'jm' }, 'LOG', '\n', true);
+  publicSubscribePairBook(pair) {
     this.publicSubscribe({
       name: 'book',
       depth: this.depth,
-    }, this.pairs);
+    }, [pair]);
+  }
+
+  publicSubscribePairTrades(pair) {
     this.publicSubscribe({
       name: 'trade',
 
-    }, this.pairs);
+    }, [pair]);
+  }
+
+  publicWsOpen(x) {
+    this.log('public socket open', { x: x || 'jm' }, 'LOG', '\n', true);
+    for (let i = 0; i < this.pairs.length; i++) {
+      this.publicSubscribePairBook(this.pairs[i]);
+      this.publicSubscribePairTrades(this.pairs[i]);
+    }
+
     this.sendDelayedPublicPing();
+    this.initiated.public = true;
+    this.emitOnInit();
+  }
+
+  emitOnInit(initiated = this.initiated) {
+    if (!this.initEmitted) {
+      if (this.isInitiated(initiated)) {
+        this.initEmitted = true;
+        this.emit('ready');
+      }
+    }
   }
 
   public_event_systemStatus(info) {
@@ -472,6 +576,8 @@ class Kraken extends EventEmitter {
     this.privateSubscribe({ name: 'ownTrades' });
     this.privateSubscribe({ name: 'openOrders' });
     this.sendDelayedPrivatePing();
+    this.initiated.private = true;
+    this.emitOnInit(this.initiated);
   }
 
   private_event_pong(message) {
@@ -608,9 +714,11 @@ class Kraken extends EventEmitter {
     }
     if (status === 'error' || errorMessage) {
       //    this.log('error while cancelling order', { message });
+      clearTimeout(this.pendingCancelByReqId[reqidS].timeout);
       this.pendingCancelByReqId[reqidS].reject(message);
     } else {
       //      this.log(`${this.pendingCancelByReqId[reqidS].all ? 'all' : ''}order(s) cancelled `, { txids: this.pendingCancelByReqId[reqidS].txids });
+      clearTimeout(this.pendingCancelByReqId[reqidS].timeout);
       this.pendingCancelByReqId[reqidS].resolve(message);
     }
     delete this.pendingCancelByReqId[reqidS];
@@ -771,17 +879,35 @@ class Kraken extends EventEmitter {
     return new Promise(thePromise.bind(this));
   }
 
+  pendingCancelByReqIdTimeout(reqid) {
+    return () => {
+      const reqidS = `${reqid}`;
+      if (!this.pendingCancelByReqId[reqidS]) {
+        this.log(`unknown reqid ${reqid} cancelOrderStatusTimeout`);
+        return;
+      }
+      this.pendingCancelByReqId[reqidS].reject(new Error(`cancelOrder request ${reqid} timeout`));
+
+      delete this.pendingCancelByReqId[reqidS];
+    };
+  }
+
   cancelOrder(...txids) {
     const thePromise = (resolve, reject) => {
       const reqid = this.nextReqId();
+
       this.pendingCancelByReqId[reqid] = {
-        txids, resolve, reject, all: txids.length === 0,
+        txids,
+        resolve,
+        reject,
+        all: txids.length === 0,
+        timeout: setTimeout(this.pendingCancelByReqIdTimeout(reqid).bind(this), 2000),
       };
 
       const event = { event: 'cancelOrder', token: this.token, reqid };
       this.log(`cancelling orders ${txids.length === 0 ? 'all' : `[${txids.join(', ')}]`} ${JSON.stringify(event, null, 2)}`);
       if (txids.length === 0) {
-        event.txid = [this.ordersRef];
+        event.txid = [`${this.ordersRef}`];
       } else {
         event.txid = txids;
       }
